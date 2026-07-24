@@ -31,7 +31,7 @@ const NONCE_SIZE: usize = 12; // 96-bit AES-GCM nonce
 const ARGON2_MEM_COST: u32 = 262144; // 256 MB Argon2id memory cost
 const ARGON2_TIME_COST: u32 = 12;     // Argon2id iterations
 
-const ZSTD_COMPRESSION_LEVEL: i32 = 15;
+const ZSTD_COMPRESSION_LEVEL: i32 = 22;
 
 const CRYPT_MAGIC: &[u8; 4] = b"CRPT";
 const CRYPT_VERSION: u16 = 1;
