@@ -12,7 +12,7 @@ use std::thread;
 use std::time::SystemTime;
 
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
     Aes256Gcm, Nonce, Key,
 };
 use argon2::{Argon2, Algorithm, Version, Params};
@@ -28,8 +28,9 @@ const CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 const SALT_SIZE: usize = 32; // 256-bit Argon2id salt
 const NONCE_SIZE: usize = 12; // 96-bit AES-GCM nonce
 
-const ARGON2_MEM_COST: u32 = 262144; // 256 MB Argon2id memory cost
+const ARGON2_MEM_COST: u32 = 524288; // 512 MB Argon2id memory cost
 const ARGON2_TIME_COST: u32 = 12;     // Argon2id iterations
+const ARGON2_PARALLELISM: u32 = 2;    // Fixed parallelism so keys match across machines
 
 const ZSTD_COMPRESSION_LEVEL: i32 = 22;
 
@@ -241,6 +242,19 @@ fn get_password() -> Zeroizing<String> {
     Zeroizing::new(password)
 }
 
+/// Prompt for a password twice and retry until both match.
+/// Used only on encrypt to prevent typos from locking you out.
+fn get_password_with_confirm() -> Zeroizing<String> {
+    loop {
+        let first = get_password();
+        let second = get_password();
+        if *first == *second {
+            return first;
+        }
+        eprintln!("Passwords did not match, try again.");
+    }
+}
+
 fn get_input_paths() -> Vec<PathBuf> {
     println!("Enter paths (One per line, blank line to finish):");
     let mut all_input = String::new();
@@ -305,8 +319,7 @@ fn make_salt() -> Zeroizing<[u8; SALT_SIZE]> {
 }
 
 fn build_argon2() -> Argon2<'static> {
-    let lanes = num_cpus::get().max(1) as u32;
-    let params = Params::new(ARGON2_MEM_COST, ARGON2_TIME_COST, lanes, None)
+    let params = Params::new(ARGON2_MEM_COST, ARGON2_TIME_COST, ARGON2_PARALLELISM, None)
         .expect("invalid argon2 params");
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
@@ -319,11 +332,11 @@ fn derive_key(password: &str, salt: &[u8; SALT_SIZE]) -> Zeroizing<[u8; 32]> {
     key
 }
 
-fn aes_encrypt(data: &[u8], key: &[u8]) -> std::io::Result<Vec<u8>> {
+fn aes_encrypt(data: &[u8], key: &[u8], aad: &[u8]) -> std::io::Result<Vec<u8>> {
     let key = Key::<Aes256Gcm>::from_slice(key);
     let cipher = Aes256Gcm::new(key);
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    let ciphertext = cipher.encrypt(&nonce, data).map_err(|e| {
+    let ciphertext = cipher.encrypt(&nonce, Payload { msg: data, aad }).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::Other, format!("AES-GCM encryption failed: {}", e))
     })?;
     let mut result = nonce.to_vec();
@@ -331,13 +344,14 @@ fn aes_encrypt(data: &[u8], key: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(result)
 }
 
-fn aes_decrypt(encrypted: &[u8], key: &[u8]) -> Result<Vec<u8>, aes_gcm::aead::Error> {
+fn aes_decrypt(encrypted: &[u8], key: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>, aes_gcm::aead::Error> {
     if encrypted.len() < NONCE_SIZE { return Err(aes_gcm::aead::Error); }
     let nonce = &encrypted[..NONCE_SIZE];
     let ciphertext = &encrypted[NONCE_SIZE..];
     let key = Key::<Aes256Gcm>::from_slice(key);
     let cipher = Aes256Gcm::new(key);
-    cipher.decrypt(Nonce::from_slice(nonce), ciphertext)
+    cipher.decrypt(Nonce::from_slice(nonce), Payload { msg: ciphertext, aad })
+        .map(Zeroizing::new)
 }
 
 /// Hash the current timestamp and return the first 8 hex characters.
@@ -467,7 +481,8 @@ fn write_crypt_header(
     header_plaintext.extend_from_slice(&(name_len as u16).to_le_bytes());
     header_plaintext.extend_from_slice(name_bytes);
 
-    let encrypted_header = aes_encrypt(&header_plaintext, key)?;
+    // Header gets no AAD — it's metadata, not a data-bearing chunk.
+    let encrypted_header = aes_encrypt(&header_plaintext, key, &[])?;
     let header_total_len = encrypted_header.len() as u16;
     output_file.write_all(&header_total_len.to_le_bytes())?;
     output_file.write_all(&encrypted_header)?;
@@ -479,12 +494,18 @@ struct RawChunk {
     data: Zeroizing<Vec<u8>>,
 }
 
-struct FinishedChunk {
+/// Compressed but not yet encrypted. Workers produce these; the main
+/// writer thread encrypts each one with an AAD binding its chunk index
+/// (prevents reordering/duplication) and writes to disk incrementally
+/// with a bounded pending map.
+struct CompressedChunk {
     index: u64,
     compressed_len: u32,
-    encrypted: Vec<u8>,
+    compressed: Zeroizing<Vec<u8>>,
 }
 
+/// Encrypted chunk read from disk. AAD on decrypt uses only the chunk
+/// index (no is_last flag), so the decrypt reader is straightforward.
 struct EncryptedChunk {
     index: u64,
     data: Vec<u8>,
@@ -492,20 +513,32 @@ struct EncryptedChunk {
 
 struct DecryptedChunk {
     index: u64,
-    data: Vec<u8>,
+    data: Zeroizing<Vec<u8>>,
+}
+
+/// Build an AAD tag for a data chunk: the chunk index encoded as u64 LE.
+/// This binds each ciphertext to its position in the chunk sequence,
+/// preventing undetected reordering or duplication.
+fn chunk_aad(index: u64) -> Vec<u8> {
+    index.to_le_bytes().to_vec()
 }
 
 fn main() -> std::io::Result<()> {
-    std::env::set_var("RUST_BACKTRACE", "full");
-
     let config = load_config();
     let num_workers = config.num_workers.max(1);
 
     let num_cores = num_cpus::get();
     println!("Detected {} CPU cores. Using {} worker(s) (config).", num_cores, num_workers);
 
-    let mut password = get_password();
-    let decrypt_password: Zeroizing<String> = Zeroizing::new(password.to_string());
+    // Get the operation choice first so we know whether to prompt once or twice.
+    let choice = get_choice();
+
+    let mut password = match choice {
+        'e' => get_password_with_confirm(),
+        'd' => get_password(),
+        _ => unreachable!(),
+    };
+    let mut decrypt_password: Zeroizing<String> = Zeroizing::new(password.to_string());
 
     use std::sync::mpsc;
     let (key_tx, key_rx) = mpsc::channel();
@@ -526,7 +559,6 @@ fn main() -> std::io::Result<()> {
     }
 
     let output_dir = get_output_dir();
-    let choice = get_choice();
 
     match choice {
         'e' => {
@@ -545,7 +577,11 @@ fn main() -> std::io::Result<()> {
             let base_dir = output_dir.as_deref().unwrap_or(
                 input_paths[0].parent().unwrap_or(Path::new("."))
             );
-            let output_path = base_dir.join(format!("{}-{}.crypt", stem, date_hash()));
+
+            // Write to .coffin first; rename to .crypt only after everything succeeds.
+            // If the process crashes mid-encryption, a .coffin file is clearly partial.
+            let coffin_path = base_dir.join(format!("{}-{}.coffin", stem, date_hash()));
+            let crypt_path = coffin_path.with_extension("crypt");
 
             let mut total_input_size = 0u64;
             for path in &input_paths {
@@ -554,8 +590,7 @@ fn main() -> std::io::Result<()> {
             }
             println!("  Total input size: ~{} MB", total_input_size / (1024 * 1024));
 
-            // Pipeline: Tar thread (I/O) -> Pipe reader (I/O) -> crossbeam (CPU workers) -> Writer (I/O)
-            // crossbeam_channel supports multiple consumers so workers pull in parallel.
+            // Pipeline: Tar thread (I/O) -> Pipe reader (I/O) -> crossbeam (CPU workers: compress only) -> Writer (encrypt with AAD + write)
 
             let (pipe_reader, pipe_writer) = os_pipe::pipe()?;
 
@@ -568,9 +603,7 @@ fn main() -> std::io::Result<()> {
             // Bounded to num_workers so the pipe reader blocks when workers are busy,
             // creating natural backpressure that prevents memory from piling up.
             let (raw_tx, raw_rx) = crossbeam_channel::bounded::<RawChunk>(num_workers);
-            let (finished_tx, finished_rx) = crossbeam_channel::bounded::<FinishedChunk>(num_workers * 2);
-
-            let key_for_workers = Arc::new(Zeroizing::new(key.as_ref().to_vec()));
+            let (compressed_tx, compressed_rx) = crossbeam_channel::bounded::<CompressedChunk>(num_workers * 2);
 
             let progress = Arc::new(AtomicU64::new(0));
             let done = Arc::new(AtomicBool::new(false));
@@ -625,8 +658,7 @@ fn main() -> std::io::Result<()> {
             let mut worker_handles = Vec::new();
             for _ in 0..num_workers {
                 let raw_rx = raw_rx.clone();
-                let finished_tx = finished_tx.clone();
-                let key_w = Arc::clone(&key_for_workers);
+                let compressed_tx = compressed_tx.clone();
                 let progress_w = Arc::clone(&progress);
 
                 let handle = thread::spawn(move || -> std::io::Result<()> {
@@ -644,17 +676,14 @@ fn main() -> std::io::Result<()> {
                         // Drop 16 MB raw chunk before allocating encrypted output
                         drop(raw);
 
-                        let encrypted = aes_encrypt(&compressed, &**key_w)?;
-                        drop(compressed);
-
                         progress_w.fetch_add(raw_len, Ordering::SeqCst);
 
-                        let finished = FinishedChunk {
+                        let chunk = CompressedChunk {
                             index: raw_index,
                             compressed_len,
-                            encrypted,
+                            compressed: Zeroizing::new(compressed),
                         };
-                        if finished_tx.send(finished).is_err() {
+                        if compressed_tx.send(chunk).is_err() {
                             break;
                         }
                     }
@@ -663,42 +692,50 @@ fn main() -> std::io::Result<()> {
                 worker_handles.push(handle);
             }
 
-            // Drop the original finished_tx so the channel closes when all workers finish.
+            // Drop the original compressed_tx so the channel closes when all workers finish.
             // raw_tx is owned by the pipe reader thread and drops automatically.
-            drop(finished_tx);
+            drop(compressed_tx);
 
-            // Writer reorders chunks by index. Cap pending to num_workers * 3 to prevent
-            // unbounded memory growth if chunks arrive severely out of order.
-            let mut output_file = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&output_path)?);
+            // Writer reorders chunks by index, encrypts each with AAD = chunk_index,
+            // and writes to disk incrementally. The pending map is bounded to
+            // num_workers * 3 to prevent memory from piling up if chunks arrive
+            // severely out of order.
+            let mut output_file = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&coffin_path)?);
             write_crypt_header(&mut output_file, key.as_ref(), salt.as_ref(), is_directory, &archive_name)?;
 
             let mut next_index: u64 = 0;
-            let mut pending: HashMap<u64, FinishedChunk> = HashMap::new();
+            let mut pending: HashMap<u64, CompressedChunk> = HashMap::new();
             let mut total_chunks: u64 = 0;
 
-            while let Ok(finished) = finished_rx.recv() {
+            while let Ok(chunk) = compressed_rx.recv() {
                 if pending.len() >= num_workers * 3 {
                     while let Some(chunk) = pending.remove(&next_index) {
+                        let aad = chunk_aad(chunk.index);
+                        let encrypted = aes_encrypt(&chunk.compressed, key.as_ref(), &aad)?;
                         output_file.write_all(&chunk.compressed_len.to_le_bytes())?;
-                        output_file.write_all(&chunk.encrypted)?;
+                        output_file.write_all(&encrypted)?;
                         next_index += 1;
                         total_chunks += 1;
                     }
                 }
 
-                pending.insert(finished.index, finished);
+                pending.insert(chunk.index, chunk);
 
                 while let Some(chunk) = pending.remove(&next_index) {
+                    let aad = chunk_aad(chunk.index);
+                    let encrypted = aes_encrypt(&chunk.compressed, key.as_ref(), &aad)?;
                     output_file.write_all(&chunk.compressed_len.to_le_bytes())?;
-                    output_file.write_all(&chunk.encrypted)?;
+                    output_file.write_all(&encrypted)?;
                     next_index += 1;
                     total_chunks += 1;
                 }
             }
 
             while let Some(chunk) = pending.remove(&next_index) {
+                let aad = chunk_aad(chunk.index);
+                let encrypted = aes_encrypt(&chunk.compressed, key.as_ref(), &aad)?;
                 output_file.write_all(&chunk.compressed_len.to_le_bytes())?;
-                output_file.write_all(&chunk.encrypted)?;
+                output_file.write_all(&encrypted)?;
                 next_index += 1;
                 total_chunks += 1;
             }
@@ -709,7 +746,10 @@ fn main() -> std::io::Result<()> {
 
             output_file.write_all(&0u32.to_le_bytes())?;
             output_file.flush()?;
+            drop(output_file);
 
+            // Rename .coffin -> .crypt only after everything is flushed and threads are joined.
+            // If anything fails between create and rename, the .coffin stays as a partial marker.
             done.store(true, Ordering::SeqCst);
 
             pipe_reader_handle.join().unwrap().map_err(|e| {
@@ -728,11 +768,14 @@ fn main() -> std::io::Result<()> {
 
             progress_handle.join().unwrap();
 
+            // All threads succeeded — atomically rename to .crypt.
+            fs::rename(&coffin_path, &crypt_path)?;
+
             drop(key);
             drop(salt);
 
-            let final_size = fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
-            println!("Encryption complete: {} ({} MB, {} chunks)", output_path.display(), final_size / (1024 * 1024), total_chunks);
+            let final_size = fs::metadata(&crypt_path).map(|m| m.len()).unwrap_or(0);
+            println!("Encryption complete: {} ({} MB, {} chunks)", crypt_path.display(), final_size / (1024 * 1024), total_chunks);
         }
 
         'd' => {
@@ -770,7 +813,8 @@ fn main() -> std::io::Result<()> {
                 let salt_zero = Zeroizing::new(salt);
                 let key = derive_key(&*decrypt_password, &salt_zero);
 
-                let header_plaintext = match aes_decrypt(&header_encrypted, key.as_ref()) {
+                // Header decrypt uses empty AAD (no chunk-level binding needed for metadata).
+                let header_plaintext = match aes_decrypt(&header_encrypted, key.as_ref(), &[]) {
                     Ok(pt) => pt,
                     Err(e) => { eprintln!("Error decrypting '{}' header: {}. Wrong password or corrupted file. Skipping.", input_path.display(), e); continue; }
                 };
@@ -788,7 +832,7 @@ fn main() -> std::io::Result<()> {
                 );
                 let output_path_dir = parent.join(&safe_name);
 
-                // Pipeline: Chunk reader (I/O) -> crossbeam (CPU workers) -> Pipe writer (I/O)
+                // Pipeline: Chunk reader (I/O) -> crossbeam (CPU workers: decrypt + decompress) -> Pipe writer (I/O)
 
                 let (raw_pipe_reader, raw_pipe_writer) = os_pipe::pipe()?;
 
@@ -827,16 +871,28 @@ fn main() -> std::io::Result<()> {
                     crypt_file.seek(std::io::SeekFrom::Start(header_skip))?;
                     let mut chunk_reader = BufReader::with_capacity(8 * 1024 * 1024, crypt_file);
                     let mut chunk_index: u64 = 0;
+                    let mut found_sentinel = false;
 
                     loop {
                         let mut pt_len_bytes = [0u8; 4];
                         match chunk_reader.read_exact(&mut pt_len_bytes) {
                             Ok(()) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                                if !found_sentinel {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "File truncated: missing end-of-chunks sentinel (0u32 trailer). Data may be incomplete.",
+                                    ));
+                                }
+                                break;
+                            }
                             Err(e) => return Err(e),
                         }
                         let pt_len = u32::from_le_bytes(pt_len_bytes) as usize;
-                        if pt_len == 0 { break; }
+                        if pt_len == 0 {
+                            found_sentinel = true;
+                            break;
+                        }
 
                         let chunk_len = 12 + pt_len + 16;
                         let mut chunk_data = vec![0u8; chunk_len];
@@ -868,8 +924,12 @@ fn main() -> std::io::Result<()> {
                                 Err(_) => break,
                             };
 
-                            let compressed = aes_decrypt(&chunk.data, &**key_w).map_err(|_| {
-                                std::io::Error::new(std::io::ErrorKind::InvalidData, "Chunk decryption failed.")
+                            // AAD = chunk index only (no is_last flag).
+                            let aad = chunk_aad(chunk.index);
+
+                            let compressed = aes_decrypt(&chunk.data, &**key_w, &aad).map_err(|_| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData,
+                                    "Chunk decryption failed (AAD mismatch — chunk reordering or corruption detected).")
                             })?;
 
                             let raw = decompress_frame(&compressed)?;
@@ -880,7 +940,7 @@ fn main() -> std::io::Result<()> {
 
                             let decrypted = DecryptedChunk {
                                 index: chunk.index,
-                                data: raw,
+                                data: Zeroizing::new(raw),
                             };
                             if dec_tx.send(decrypted).is_err() {
                                 break;
@@ -970,6 +1030,8 @@ fn main() -> std::io::Result<()> {
 
                 println!("Decrypted into: {}", output_path_dir.display());
             }
+
+            decrypt_password.zeroize();
 
         }
 
