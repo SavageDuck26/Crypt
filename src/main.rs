@@ -28,34 +28,42 @@ const CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 const SALT_SIZE: usize = 32; // 256-bit Argon2id salt
 const NONCE_SIZE: usize = 12; // 96-bit AES-GCM nonce
 
-const ARGON2_MEM_COST: u32 = 524288; // 512 MB Argon2id memory cost
-const ARGON2_TIME_COST: u32 = 12;     // Argon2id iterations
-const ARGON2_PARALLELISM: u32 = 2;    // Fixed parallelism so keys match across machines
-
-const ZSTD_COMPRESSION_LEVEL: i32 = 22;
-
 const CRYPT_MAGIC: &[u8; 4] = b"CRPT";
 const CRYPT_VERSION: u16 = 1;
 
-// Default worker threads (used if CryptConfig.json is missing).
-const DEFAULT_NUM_WORKERS: usize = 1;
+// Default worker threads 
+const DEFAULT_NUM_WORKERS: usize = 2;
+
+// Default Argon2id parameters 
+const DEFAULT_ARGON2_MEM_COST: u32 = 524288;     // 512 MB
+const DEFAULT_ARGON2_TIME_COST: u32 = 12;
+const DEFAULT_ARGON2_PARALLELISM: u32 = 2;
+
+const DEFAULT_ZSTD_COMPRESSION_LEVEL: i32 = 22;
 
 // JSON config read from CryptConfig.json alongside the binary.
 #[derive(Serialize, Deserialize)]
 struct Config {
     num_workers: usize,
+    argon2_mem_cost: u32,
+    argon2_time_cost: u32,
+    argon2_parallelism: u32,
+    zstd_compression_level: i32,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             num_workers: DEFAULT_NUM_WORKERS,
+            argon2_mem_cost: DEFAULT_ARGON2_MEM_COST,
+            argon2_time_cost: DEFAULT_ARGON2_TIME_COST,
+            argon2_parallelism: DEFAULT_ARGON2_PARALLELISM,
+            zstd_compression_level: DEFAULT_ZSTD_COMPRESSION_LEVEL,
         }
     }
 }
 
-// Load CryptConfig.json from the executable's directory.
-// Creates a default config if one doesn't exist.
+
 fn load_config() -> Config {
     let config_path = {
         let exe = env::current_exe().expect("Failed to get executable path");
@@ -242,8 +250,7 @@ fn get_password() -> Zeroizing<String> {
     Zeroizing::new(password)
 }
 
-/// Prompt for a password twice and retry until both match.
-/// Used only on encrypt to prevent typos from locking you out.
+// Used only on encrypt to prevent typos from locking you out.
 fn get_password_with_confirm() -> Zeroizing<String> {
     loop {
         let first = get_password();
@@ -318,15 +325,15 @@ fn make_salt() -> Zeroizing<[u8; SALT_SIZE]> {
     Zeroizing::new(salt)
 }
 
-fn build_argon2() -> Argon2<'static> {
-    let params = Params::new(ARGON2_MEM_COST, ARGON2_TIME_COST, ARGON2_PARALLELISM, None)
+fn build_argon2(mem_cost: u32, time_cost: u32, parallelism: u32) -> Argon2<'static> {
+    let params = Params::new(mem_cost, time_cost, parallelism, None)
         .expect("invalid argon2 params");
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
-fn derive_key(password: &str, salt: &[u8; SALT_SIZE]) -> Zeroizing<[u8; 32]> {
+fn derive_key(password: &str, salt: &[u8; SALT_SIZE], config: &Config) -> Zeroizing<[u8; 32]> {
     let mut key = Zeroizing::new([0u8; 32]);
-    build_argon2()
+    build_argon2(config.argon2_mem_cost, config.argon2_time_cost, config.argon2_parallelism)
         .hash_password_into(password.as_bytes(), salt, &mut *key)
         .expect("key derivation failed");
     key
@@ -354,8 +361,8 @@ fn aes_decrypt(encrypted: &[u8], key: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec
         .map(Zeroizing::new)
 }
 
-/// Hash the current timestamp and return the first 8 hex characters.
-/// This produces a unique suffix so repeated backups don't collide.
+// Hash the current timestamp and return the first 8 hex characters.
+// This produces a unique suffix so repeated backups don't collide.
 fn date_hash() -> String {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -441,10 +448,10 @@ fn stream_files_to_tar<W: Write + Send + 'static>(
     Ok(())
 }
 
-fn compress_frame(data: &[u8]) -> std::io::Result<Vec<u8>> {
+fn compress_frame(data: &[u8], compression_level: i32) -> std::io::Result<Vec<u8>> {
     let mut compressed = Vec::new();
     {
-        let mut encoder = ZstdEncoder::new(&mut compressed, ZSTD_COMPRESSION_LEVEL)?;
+        let mut encoder = ZstdEncoder::new(&mut compressed, compression_level)?;
         encoder.write_all(data)?;
         encoder.finish()?;
     }
@@ -494,18 +501,18 @@ struct RawChunk {
     data: Zeroizing<Vec<u8>>,
 }
 
-/// Compressed but not yet encrypted. Workers produce these; the main
-/// writer thread encrypts each one with an AAD binding its chunk index
-/// (prevents reordering/duplication) and writes to disk incrementally
-/// with a bounded pending map.
+// Compressed but not yet encrypted. Workers produce these; the main
+// writer thread encrypts each one with an AAD binding its chunk index
+// (prevents reordering/duplication) and writes to disk incrementally
+// with a bounded pending map.
 struct CompressedChunk {
     index: u64,
     compressed_len: u32,
     compressed: Zeroizing<Vec<u8>>,
 }
 
-/// Encrypted chunk read from disk. AAD on decrypt uses only the chunk
-/// index (no is_last flag), so the decrypt reader is straightforward.
+// Encrypted chunk read from disk. AAD on decrypt uses only the chunk
+// index (no is_last flag), so the decrypt reader is straightforward.
 struct EncryptedChunk {
     index: u64,
     data: Vec<u8>,
@@ -516,9 +523,9 @@ struct DecryptedChunk {
     data: Zeroizing<Vec<u8>>,
 }
 
-/// Build an AAD tag for a data chunk: the chunk index encoded as u64 LE.
-/// This binds each ciphertext to its position in the chunk sequence,
-/// preventing undetected reordering or duplication.
+// Build an AAD tag for a data chunk: the chunk index encoded as u64 LE.
+// This binds each ciphertext to its position in the chunk sequence,
+// preventing undetected reordering or duplication.
 fn chunk_aad(index: u64) -> Vec<u8> {
     index.to_le_bytes().to_vec()
 }
@@ -544,9 +551,16 @@ fn main() -> std::io::Result<()> {
     let (key_tx, key_rx) = mpsc::channel();
     let pw_for_thread = password.clone();
     password.zeroize();
+    let config_for_thread = Config {
+        num_workers: config.num_workers,
+        argon2_mem_cost: config.argon2_mem_cost,
+        argon2_time_cost: config.argon2_time_cost,
+        argon2_parallelism: config.argon2_parallelism,
+        zstd_compression_level: config.zstd_compression_level,
+    };
     let handle_derive = thread::spawn(move || {
         let salt = make_salt();
-        let key = derive_key(&pw_for_thread, &salt);
+        let key = derive_key(&pw_for_thread, &salt, &config_for_thread);
         let result: (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) = (salt, key);
         let _ = key_tx.send(result);
     });
@@ -590,7 +604,8 @@ fn main() -> std::io::Result<()> {
             }
             println!("  Total input size: ~{} MB", total_input_size / (1024 * 1024));
 
-            // Pipeline: Tar thread (I/O) -> Pipe reader (I/O) -> crossbeam (CPU workers: compress only) -> Writer (encrypt with AAD + write)
+            // Pipeline: Tar thread (I/O) -> Pipe reader (I/O) -> crossbeam (CPU workers: compress only)
+            // -> Writer (encrypt with AAD + write)
 
             let (pipe_reader, pipe_writer) = os_pipe::pipe()?;
 
@@ -655,6 +670,7 @@ fn main() -> std::io::Result<()> {
                 Ok(())
             });
 
+            let zstd_level = config.zstd_compression_level;
             let mut worker_handles = Vec::new();
             for _ in 0..num_workers {
                 let raw_rx = raw_rx.clone();
@@ -671,7 +687,7 @@ fn main() -> std::io::Result<()> {
                         let raw_index = raw.index;
                         let raw_len = raw.data.len() as u64;
 
-                        let compressed = compress_frame(&raw.data)?;
+                        let compressed = compress_frame(&raw.data, zstd_level)?;
                         let compressed_len = compressed.len() as u32;
                         // Drop 16 MB raw chunk before allocating encrypted output
                         drop(raw);
@@ -811,7 +827,7 @@ fn main() -> std::io::Result<()> {
                 if preader.read_exact(&mut header_encrypted).is_err() { eprintln!("Error: '{}' is truncated (missing header data). Skipping.", input_path.display()); continue; }
 
                 let salt_zero = Zeroizing::new(salt);
-                let key = derive_key(&*decrypt_password, &salt_zero);
+                let key = derive_key(&*decrypt_password, &salt_zero, &config);
 
                 // Header decrypt uses empty AAD (no chunk-level binding needed for metadata).
                 let header_plaintext = match aes_decrypt(&header_encrypted, key.as_ref(), &[]) {
