@@ -22,7 +22,6 @@ use tar;
 use termios::{Termios, ECHO, ICANON, TCSANOW};
 use zeroize::{Zeroize, Zeroizing};
 use zstd::stream::read::Decoder as ZstdDecoder;
-use zstd::stream::write::Encoder as ZstdEncoder;
 
 const CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 const SALT_SIZE: usize = 32; // 256-bit Argon2id salt
@@ -448,16 +447,6 @@ fn stream_files_to_tar<W: Write + Send + 'static>(
     Ok(())
 }
 
-fn compress_frame(data: &[u8], compression_level: i32) -> std::io::Result<Vec<u8>> {
-    let mut compressed = Vec::new();
-    {
-        let mut encoder = ZstdEncoder::new(&mut compressed, compression_level)?;
-        encoder.write_all(data)?;
-        encoder.finish()?;
-    }
-    Ok(compressed)
-}
-
 fn decompress_frame(data: &[u8]) -> std::io::Result<Vec<u8>> {
     let decoder = ZstdDecoder::new(Cursor::new(data))?;
     let mut decompressed = Vec::new();
@@ -678,6 +667,10 @@ fn main() -> std::io::Result<()> {
                 let progress_w = Arc::clone(&progress);
 
                 let handle = thread::spawn(move || -> std::io::Result<()> {
+                    // Create one zstd compression context per worker and reuse it
+                    // for every chunk instead of allocating a fresh CCtx per
+                    // chunk (which peaked at ~4-5 GB per worker at level 22).
+                    let mut compressor = zstd::bulk::Compressor::new(zstd_level)?;
                     loop {
                         let raw = match raw_rx.recv() {
                             Ok(chunk) => chunk,
@@ -687,7 +680,7 @@ fn main() -> std::io::Result<()> {
                         let raw_index = raw.index;
                         let raw_len = raw.data.len() as u64;
 
-                        let compressed = compress_frame(&raw.data, zstd_level)?;
+                        let compressed = compressor.compress(&raw.data)?;
                         let compressed_len = compressed.len() as u32;
                         // Drop 16 MB raw chunk before allocating encrypted output
                         drop(raw);
